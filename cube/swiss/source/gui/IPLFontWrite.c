@@ -14,21 +14,57 @@
 #include <string.h>
 #include "IPLFontWrite.h"
 
+#ifndef SWISS_ATLAS_FONT
 static u8 fontData[SYS_FONTSIZE_ANSI] ATTRIBUTE_ALIGN (32);
 static sys_fontheader *font = (sys_fontheader *)fontData;
+#endif
 
 GXTexObj fontTexObj;
 GXColor defaultColor = (GXColor) {255,255,255,255};
 GXColor disabledColor = (GXColor) {175,175,182,255};
 GXColor deSelectedColor = (GXColor) {80,80,73,255};
 
+// Font metrics are sourced either from the IPL ROM font or, when
+// SWISS_ATLAS_FONT is defined, from the bundled anti-aliased atlas. Both use
+// the same per-glyph texel (s0,t0)+advance convention and fixed cell height,
+// so the rest of this file is identical for both.
+#ifdef SWISS_ATLAS_FONT
+#define FONT_CELL_HEIGHT  (atlasFontCellHeight)
+#define FONT_GET_WIDTH(c) atlasFontGetWidth(c)
+#else
+#define FONT_CELL_HEIGHT  (font->cell_height)
+#define FONT_GET_WIDTH(c) SYS_GetFontWidth(c)
+#endif
+
+// Fetch a glyph's atlas position and advance, binding its texture for drawing.
+static void _fontGlyph(unsigned char c, int *s0, int *t0, int *width)
+{
+#ifdef SWISS_ATLAS_FONT
+	// Single atlas texture is bound once in drawFontInit(); just look up metrics.
+	atlasFontGetTexture(c, s0, t0, width);
+#else
+	void *image;
+	SYS_GetFontTexture(c, &image, s0, t0, width);
+	if (GX_GetTexObjData(&fontTexObj) != (void *)MEM_VIRTUAL_TO_PHYSICAL(image)) {
+		GX_InitTexObjData(&fontTexObj, image);
+		GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
+	}
+#endif
+}
+
 void init_font(void)
 {
+#ifdef SWISS_ATLAS_FONT
+	GX_InitTexObj(&fontTexObj, (void*)atlasFontTexels, atlasFontTexWidth, atlasFontTexHeight, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&fontTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_FALSE, GX_TRUE, GX_ANISO_1);
+	DCFlushRange((void*)atlasFontTexels, atlasFontTexWidth * atlasFontTexHeight);
+#else
 	SYS_SetFontEncoding(SYS_FONTENC_ANSI);
 	if(SYS_InitFont(font)) {
 		GX_InitTexObj(&fontTexObj, NULL, font->sheet_width, font->sheet_height, font->sheet_format, GX_CLAMP, GX_CLAMP, GX_FALSE);
 		GX_InitTexObjLOD(&fontTexObj, GX_LINEAR, GX_LINEAR, 0.0f, 0.0f, 0.0f, GX_TRUE, GX_TRUE, GX_ANISO_4);
 	}
+#endif
 }
 
 void drawFontInit(void)
@@ -91,49 +127,33 @@ void drawFontInit(void)
 	GX_SetCullMode (GX_CULL_NONE);
 }
 
-void drawString(int x, int y, const char *string, float scale, int align, GXColor fontColor)
+// Load the glyph-run transform for a string drawn at screen (x,y).
+static void _loadFontMtx(int x, int y, int align, int strWidth, int strHeight, float scale)
 {
-	if(string == NULL) {
-		return;
-	}
-	drawFontInit();
 	Mtx GXmodelView2D;
-	int strWidth = 0;
-	int strHeight = font->cell_height;
-	if(align)
-	{
-		const char* string_work = string;
-		while(*string_work)
-		{
-			unsigned char c = *string_work;
-			strWidth += SYS_GetFontWidth(c) - 1;
-			string_work++;
-		}
-	}
 	guMtxTrans(GXmodelView2D, -(align*strWidth)/2, -strHeight/2, 0);
 	guMtxScaleApply(GXmodelView2D, GXmodelView2D, scale, scale, 1);
 	guMtxTransApply(GXmodelView2D, GXmodelView2D, x, y, 0);
 	GX_LoadPosMtxImm(GXmodelView2D,GX_PNMTX0);
-	x = 0; y = 0;
+}
 
+// Draw a run of glyphs at the currently-loaded transform in a single colour.
+static void _drawGlyphRun(const char *string, GXColor color)
+{
+	int x = 0, y = 0;
 	while (*string)
 	{
 		unsigned char c = *string;
 		if(c == '\n') break;
-		void *image;
 		int s0, t0, width;
-		SYS_GetFontTexture(c, &image, &s0, &t0, &width);
-		if (GX_GetTexObjData(&fontTexObj) != (void *)MEM_VIRTUAL_TO_PHYSICAL(image)) {
-			GX_InitTexObjData(&fontTexObj, image);
-			GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-		}
+		_fontGlyph(c, &s0, &t0, &width);
 		int i;
 		GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
 		for (i=0; i<4; i++) {
 			int s = (i & 1) ^ ((i & 2) >> 1) ? width : 0;
-			int t = (i & 2) ? font->cell_height : 0;
+			int t = (i & 2) ? FONT_CELL_HEIGHT : 0;
 			GX_Position2s16(x + s, y + t);
-			GX_Color4u8(fontColor.r, fontColor.g, fontColor.b, fontColor.a);
+			GX_Color4u8(color.r, color.g, color.b, color.a);
 			GX_TexCoord2s16(s0 + s, t0 + t);
 		}
 		GX_End();
@@ -141,6 +161,34 @@ void drawString(int x, int y, const char *string, float scale, int align, GXColo
 		x += width - 1;
 		string++;
 	}
+}
+
+void drawString(int x, int y, const char *string, float scale, int align, GXColor fontColor)
+{
+	if(string == NULL) {
+		return;
+	}
+	drawFontInit();
+	int strWidth = 0;
+	int strHeight = FONT_CELL_HEIGHT;
+	if(align)
+	{
+		const char* string_work = string;
+		while(*string_work)
+		{
+			unsigned char c = *string_work;
+			strWidth += FONT_GET_WIDTH(c) - 1;
+			string_work++;
+		}
+	}
+	// Subtle 1px drop shadow for depth/legibility, then the text itself.
+	GXColor shadow;
+	shadow.r = shadow.g = shadow.b = 0;
+	shadow.a = (u8)((fontColor.a * 3) / 5);
+	_loadFontMtx(x + 1, y + 1, align, strWidth, strHeight, scale);
+	_drawGlyphRun(string, shadow);
+	_loadFontMtx(x, y, align, strWidth, strHeight, scale);
+	_drawGlyphRun(string, fontColor);
 }
 
 void drawStringWithCaret(int x, int y, const char *string, float scale, int align, GXColor fontColor, int caretPosition, GXColor caretColor)
@@ -151,14 +199,14 @@ void drawStringWithCaret(int x, int y, const char *string, float scale, int alig
 	drawFontInit();
 	Mtx GXmodelView2D;
 	int strWidth = 0;
-	int strHeight = font->cell_height;
+	int strHeight = FONT_CELL_HEIGHT;
 	if(align)
 	{
 		const char* string_work = string;
 		while(*string_work)
 		{
 			unsigned char c = *string_work;
-			strWidth += SYS_GetFontWidth(c) - 1;
+			strWidth += FONT_GET_WIDTH(c) - 1;
 			string_work++;
 		}
 	}
@@ -176,18 +224,13 @@ void drawStringWithCaret(int x, int y, const char *string, float scale, int alig
 			c = '|';
 		}
 		if(c == '\n') break;
-		void *image;
 		int s0, t0, width;
-		SYS_GetFontTexture(c, &image, &s0, &t0, &width);
-		if (GX_GetTexObjData(&fontTexObj) != (void *)MEM_VIRTUAL_TO_PHYSICAL(image)) {
-			GX_InitTexObjData(&fontTexObj, image);
-			GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-		}
+		_fontGlyph(c, &s0, &t0, &width);
 		int i;
 		GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
 		for (i=0; i<4; i++) {
 			int s = (i & 1) ^ ((i & 2) >> 1) ? width : 0;
-			int t = (i & 2) ? font->cell_height : 0;
+			int t = (i & 2) ? FONT_CELL_HEIGHT : 0;
 			GX_Position2s16(x + s, y + t);
 			if(pos == caretPosition)
 				GX_Color4u8(caretColor.r, caretColor.g, caretColor.b, caretColor.a);
@@ -213,12 +256,14 @@ int GetCharsThatFitInWidth(const char *string, int max, float scale)
 	while(*string_work)
 	{
 		unsigned char c = *string_work;
-		strWidth += SYS_GetFontWidth(c) - 1;
+		strWidth += FONT_GET_WIDTH(c) - 1;
 		string_work++;
 		if(strWidth * scale <= max) {
 			charCount++;
 		} else {
-			return charCount-3;
+			// Reserve room for the "..." abbreviation, but never return a
+			// negative count when fewer than three characters fit.
+			return charCount < 3 ? 0 : charCount - 3;
 		}
 	}
 	return charCount;
@@ -238,14 +283,14 @@ void drawStringEllipsis(int x, int y, const char *string, float scale, int align
 		guMtxIdentity(GXmodelView2D);
 	}
 	int strWidth = 0;
-	int strHeight = font->cell_height;
+	int strHeight = FONT_CELL_HEIGHT;
 	if(align)
 	{
 		const char* string_work = string;
 		while(*string_work)
 		{
 			unsigned char c = *string_work;
-			strWidth += SYS_GetFontWidth(c) - 1;
+			strWidth += FONT_GET_WIDTH(c) - 1;
 			string_work++;
 		}
 	}
@@ -269,18 +314,13 @@ void drawStringEllipsis(int x, int y, const char *string, float scale, int align
 			}
 		}
 		if(c == '\n') break;
-		void *image;
 		int s0, t0, width;
-		SYS_GetFontTexture(c, &image, &s0, &t0, &width);
-		if (GX_GetTexObjData(&fontTexObj) != (void *)MEM_VIRTUAL_TO_PHYSICAL(image)) {
-			GX_InitTexObjData(&fontTexObj, image);
-			GX_LoadTexObj(&fontTexObj, GX_TEXMAP0);
-		}
+		_fontGlyph(c, &s0, &t0, &width);
 		int i;
 		GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
 		for (i=0; i<4; i++) {
 			int s = (i & 1) ^ ((i & 2) >> 1) ? width : 0;
-			int t = (i & 2) ? font->cell_height : 0;
+			int t = (i & 2) ? FONT_CELL_HEIGHT : 0;
 			GX_Position2s16(x + s, y + t);
 			GX_Color4u8(fontColor.r, fontColor.g, fontColor.b, fontColor.a);
 			GX_TexCoord2s16(s0 + s, t0 + t);
@@ -293,7 +333,7 @@ void drawStringEllipsis(int x, int y, const char *string, float scale, int align
 		chars_to_draw--;
 		
 		// check if we've started (or about to start) our ellipses abbreviation
-		if(len > 0 && chars_to_draw == 0) {
+		if(len > 0 && chars_to_draw <= 0) {
 			if(dots_to_write == 0) {
 				dots_to_write = 4;
 			}
@@ -303,7 +343,7 @@ void drawStringEllipsis(int x, int y, const char *string, float scale, int align
 
 int GetFontHeight(float scale)
 {
-	int strHeight = font->cell_height * scale;
+	int strHeight = FONT_CELL_HEIGHT * scale;
 	return strHeight;
 }
 
@@ -314,7 +354,7 @@ int GetTextSizeInPixels(const char *string)
 	while(*string_work)
 	{
 		unsigned char c = *string_work;
-		strWidth += SYS_GetFontWidth(c) - 1;
+		strWidth += FONT_GET_WIDTH(c) - 1;
 		string_work++;
 	}
 	return strWidth;
@@ -327,7 +367,7 @@ float GetTextScaleToFitInWidth(const char *string, int width) {
 	{
 		unsigned char c = *string_work;
 		if(c == '\n') break;
-		strWidth += SYS_GetFontWidth(c) - 1;
+		strWidth += FONT_GET_WIDTH(c) - 1;
 		string_work++;
 	}
 	return width>strWidth ? 1.0f : (float)((float)width/(float)strWidth);

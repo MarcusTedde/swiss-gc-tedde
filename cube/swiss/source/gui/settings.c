@@ -166,10 +166,10 @@ void add_tooltip_label(uiDrawObj_t* page, int page_num, int option) {
 
 void drawSettingEntryString(uiDrawObj_t* page, int *y, char *label, char *key, bool selected, bool enabled) {
 	if(selected) {
-		DrawAddChild(page, DrawStyledLabel(20, *y, "\225", label_size, ALIGN_LEFT, enabled ? defaultColor:deSelectedColor));
+		DrawAddChild(page, DrawStyledLabel(20, *y, "\225", label_size, ALIGN_LEFT, enabled ? COL_ACCENT : deSelectedColor));
 	}
 	DrawAddChild(page, DrawStyledLabel(page_x_ofs_key, *y, label, label_size, ALIGN_LEFT, enabled ? defaultColor:deSelectedColor));
-	DrawAddChild(page, DrawStyledLabel(page_x_ofs_val, *y, key, label_size, ALIGN_LEFT, enabled && selected ? defaultColor:deSelectedColor));
+	DrawAddChild(page, DrawStyledLabel(page_x_ofs_val, *y, key, label_size, ALIGN_LEFT, enabled && selected ? COL_ACCENT : deSelectedColor));
 	*y += page_y_line; 
 }
 
@@ -1058,6 +1058,27 @@ void settings_toggle(int page, int option, int direction, ConfigEntry *gameConfi
 	}
 }
 
+// Ask the user to confirm a destructive action. Mirrors the file-delete
+// prompt: L + A confirms, B cancels. Returns true only if confirmed.
+static bool settings_confirm(const char *message) {
+	uiDrawObj_t *msgBox = DrawPublish(DrawMessageBox(D_WARN, message));
+	bool confirmed = false;
+	while(1) {
+		u16 btns = padsButtonsHeld();
+		if ((btns & (PAD_BUTTON_A|PAD_TRIGGER_L)) == (PAD_BUTTON_A|PAD_TRIGGER_L)) {
+			confirmed = true;
+			break;
+		}
+		else if (btns & PAD_BUTTON_B) {
+			break;
+		}
+		VIDEO_WaitVSync();
+	}
+	do {VIDEO_WaitVSync();} while (padsButtonsHeld() & (PAD_BUTTON_A|PAD_TRIGGER_L|PAD_BUTTON_B));
+	DrawDispose(msgBox);
+	return confirmed;
+}
+
 int show_settings(int page, int option, ConfigEntry *config) {
 	wait_network();
 	// Copy current settings to a temp copy in case the user cancels out
@@ -1068,6 +1089,7 @@ int show_settings(int page, int option, ConfigEntry *config) {
 	
 	GXRModeObj *oldmode = getVideoMode();
 	while (padsButtonsHeld() & PAD_BUTTON_A){ VIDEO_WaitVSync (); }
+	int navHoldFrames = 0;
 	while(1) {
 		uiDrawObj_t* settingsPage = settings_draw_page(page, option, config);
 		while (!((padsButtonsHeld() & PAD_BUTTON_RIGHT) 
@@ -1079,7 +1101,7 @@ int show_settings(int page, int option, ConfigEntry *config) {
 			|| (padsButtonsHeld() & PAD_BUTTON_Y)
 			|| (padsButtonsHeld() & PAD_TRIGGER_R)
 			|| (padsButtonsHeld() & PAD_TRIGGER_L)))
-			{ VIDEO_WaitVSync (); }
+			{ navHoldFrames = 0; VIDEO_WaitVSync (); }
 		u16 btns = padsButtonsHeld();
 		if(btns & PAD_BUTTON_Y) {
 			char *tooltip = get_tooltip(page, option);
@@ -1188,26 +1210,39 @@ int show_settings(int page, int option, ConfigEntry *config) {
 										in_range(option, SET_SMB_HOSTIP,  SET_RT4K_PORT))) {
 				settings_toggle(page, option, 0, config);
 			}
-			if(page == PAGE_GAME_GLOBAL && option == SET_GLOBAL_DEFAULTS) {
-				settings_toggle(page, option, 0, config);
-			}
-			if(page == PAGE_GAME_DEFAULTS && option == SET_DEFAULT_DEFAULTS) {
-				settings_toggle(page, option, 0, config);
-			}
-			if(page == PAGE_GAME && option == SET_DEFAULTS) {
-				settings_toggle(page, option, 0, config);
+			if((page == PAGE_GAME_GLOBAL && option == SET_GLOBAL_DEFAULTS)
+			|| (page == PAGE_GAME_DEFAULTS && option == SET_DEFAULT_DEFAULTS)
+			|| (page == PAGE_GAME && option == SET_DEFAULTS)) {
+				if(settings_confirm("Reset these settings to defaults?\n \nPress L + A to continue, or B to cancel."))
+					settings_toggle(page, option, 0, config);
 			}
 		}
-		while ((padsButtonsHeld() & PAD_BUTTON_RIGHT) 
-				|| (padsButtonsHeld() & PAD_BUTTON_LEFT) 
-				|| (padsButtonsHeld() & PAD_BUTTON_UP) 
-				|| (padsButtonsHeld() & PAD_BUTTON_DOWN) 
-				|| (padsButtonsHeld() & PAD_BUTTON_B) 
-				|| (padsButtonsHeld() & PAD_BUTTON_A)
-				|| (padsButtonsHeld() & PAD_BUTTON_Y)
-				|| (padsButtonsHeld() & PAD_TRIGGER_R)
-				|| (padsButtonsHeld() & PAD_TRIGGER_L))
-			{ VIDEO_WaitVSync (); }
+		// Auto-repeat held up/down so long settings pages scroll while held.
+		// Left/right (value toggles) and the shoulder page buttons still need a
+		// fresh press, so only repeat when up or down is held on its own.
+		u16 held = padsButtonsHeld();
+		u16 navUpDown = held & (PAD_BUTTON_UP | PAD_BUTTON_DOWN);
+		if(navUpDown && !(held & ~(u16)(PAD_BUTTON_UP | PAD_BUTTON_DOWN))) {
+			navHoldFrames++;
+			int rate = VIDEO_GetRetraceRate();
+			int delay = (navHoldFrames == 1) ? (rate * 3) / 10 : (navHoldFrames < 6 ? (rate * 12) / 100 : rate / 20);
+			if(delay < 1) delay = 1;
+			for(int i = 0; i < delay && (padsButtonsHeld() & (PAD_BUTTON_UP | PAD_BUTTON_DOWN)) == navUpDown; i++)
+				VIDEO_WaitVSync();
+		}
+		else {
+			navHoldFrames = 0;
+			while ((padsButtonsHeld() & PAD_BUTTON_RIGHT)
+					|| (padsButtonsHeld() & PAD_BUTTON_LEFT)
+					|| (padsButtonsHeld() & PAD_BUTTON_UP)
+					|| (padsButtonsHeld() & PAD_BUTTON_DOWN)
+					|| (padsButtonsHeld() & PAD_BUTTON_B)
+					|| (padsButtonsHeld() & PAD_BUTTON_A)
+					|| (padsButtonsHeld() & PAD_BUTTON_Y)
+					|| (padsButtonsHeld() & PAD_TRIGGER_R)
+					|| (padsButtonsHeld() & PAD_TRIGGER_L))
+				{ VIDEO_WaitVSync (); }
+		}
 		DrawDispose(settingsPage);
 	}
 }
